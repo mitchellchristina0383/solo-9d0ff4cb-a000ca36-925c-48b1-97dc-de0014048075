@@ -33,6 +33,8 @@ class ArtifactOut(BaseModel):
     created_at: float
     last_used_at: float
     active_tokens: int
+    shared: bool
+    references: int
     downloadable: bool
 
 
@@ -123,9 +125,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         version="1.0.0",
         description=(
             "Content-addressed cache for CI build artifacts. Uploads are "
-            "SHA-256 verified and capped at 1 MiB. Downloads require a "
-            "time-limited lease token. Reclamation frees LRU, unoccupied "
-            "artifacts first."
+            "SHA-256 verified and capped at 1 MiB. Identical content is "
+            "stored once and shared across artifact numbers and generations. "
+            "Downloads require a time-limited lease token. Reclamation frees "
+            "LRU, unoccupied artifacts first and only counts bytes actually "
+            "released on disk."
         ),
         lifespan=lifespan,
     )

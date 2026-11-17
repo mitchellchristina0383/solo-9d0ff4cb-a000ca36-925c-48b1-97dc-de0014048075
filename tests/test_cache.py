@@ -244,9 +244,13 @@ def test_reclaim_selected_artifact_issues_no_tokens_and_reupload_is_safe(tmp_pat
         assert meta["generation"] == 2 and meta["downloadable"] is True
         token = acquire(c, "a")
         assert download(c, "a", token).content == b"new-content"
-        # Only the generation-2 file remains on disk.
-        files = os.listdir(os.path.join(store.storage_dir, "a"))
-        assert len(files) == 1 and files[0].startswith("00000002-")
+        # Only the blob of the generation-2 content remains on disk.
+        blob_files = [
+            name
+            for _, _, files in os.walk(os.path.join(store.storage_dir, "blobs"))
+            for name in files
+        ]
+        assert blob_files == [sha(b"new-content")]
 
 
 def test_renew_rejected_when_artifact_pending_reclaim(tmp_path):
@@ -267,8 +271,7 @@ def test_missing_file_is_not_claimed_downloadable(tmp_path):
         put(c, "a", b"data-a")
         token = acquire(c, "a")
         store = c.app.state.store
-        a_dir = os.path.join(store.storage_dir, "a")
-        victim = os.path.join(a_dir, os.listdir(a_dir)[0])
+        victim = store._blob_path(sha(b"data-a"))
         os.remove(victim)
 
         assert c.get("/artifacts/a").json()["downloadable"] is False
@@ -289,18 +292,25 @@ def test_delete_failure_continues_cleanup_and_recovers(tmp_path):
         put(c, "a", b"a" * 10)
         put(c, "b", b"b" * 20)
         store = c.app.state.store
-        a_dir = os.path.join(store.storage_dir, "a")
-        a_file = os.path.join(a_dir, os.listdir(a_dir)[0])
+        a_digest = sha(b"a" * 10)
+        a_file = store._blob_path(a_digest)
         os.remove(a_file)
         os.mkdir(a_file)  # os.remove() on a directory fails -> deletion error
 
         r = c.post("/reclaim", json={"target_bytes": 30})
         body = r.json()
-        assert body["freed_bytes"] == 20          # b reclaimed, a failed
+        assert body["freed_bytes"] == 20          # b reclaimed, a's blob failed
         assert len(body["errors"]) == 1
         assert body["errors"][0]["number"] == "a"
         assert c.get("/artifacts/b").status_code == 404
-        assert c.get("/artifacts/a").json()["state"] == "reclaiming"  # kept for retry
+        # The artifact record is gone; the zero-ref blob stays 'reclaiming'
+        # for retry, and no downloadable record points at the stuck file.
+        assert c.get("/artifacts/a").status_code == 404
+        with store.lock:
+            brow = store.conn.execute(
+                "SELECT state, ref_count FROM blobs WHERE sha256=?", (a_digest,)
+            ).fetchone()
+        assert brow["state"] == "reclaiming" and brow["ref_count"] == 0
 
         # Repair the obstacle; the next reclaim retries the pending deletion.
         os.rmdir(a_file)
@@ -308,7 +318,10 @@ def test_delete_failure_continues_cleanup_and_recovers(tmp_path):
             fh.write(b"a" * 10)
         r = c.post("/reclaim", json={"target_bytes": 30})
         assert r.json()["freed_bytes"] == 10
-        assert c.get("/artifacts/a").status_code == 404
+        with store.lock:
+            assert store.conn.execute(
+                "SELECT COUNT(*) AS c FROM blobs WHERE sha256=?", (a_digest,)
+            ).fetchone()["c"] == 0
 
 
 def test_restart_completes_interrupted_reclaim(tmp_path):
@@ -326,7 +339,11 @@ def test_restart_completes_interrupted_reclaim(tmp_path):
         assert c2.get("/artifacts/b").status_code == 200
         token = acquire(c2, "b")
         assert download(c2, "b", token).status_code == 200
-    assert not os.path.exists(os.path.join(cfg.storage_dir, "a"))
+    # a's blob file was physically released; b's shared-safe blob remains.
+    assert not os.path.exists(os.path.join(cfg.storage_dir, "blobs", sha(b"data-a")[:2]))
+    assert os.path.exists(
+        os.path.join(cfg.storage_dir, "blobs", sha(b"data-b")[:2], sha(b"data-b"))
+    )
 
 
 def test_orphan_files_swept_with_grace(tmp_path):
